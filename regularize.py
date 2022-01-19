@@ -1,41 +1,118 @@
-import random
-from skimage import io
-from skimage.transform import rotate
+print('Importing packages and modules...')
+import argparse
+import multiprocessing
+import logging
+import logging.config
+
 import numpy as np
 import torch
-from tqdm import tqdm
-import gdal
-import os
-import glob
-from skimage.segmentation import mark_boundaries
-from PIL import Image, ImageDraw, ImageFont
-from numpy.linalg import svd
-import cv2
 from skimage import measure
-
-from models import GeneratorResNet, Encoder
 from skimage.transform import rescale
-import variables as var
+from torch import nn
+
+np.random.seed(1234)  # Set random seed for reproducibility
+import rasterio
+import time
+
+from pathlib import Path
+from tqdm import tqdm
+
+logging.getLogger(__name__)
+
+print('Done')
+
+class ResidualBlock(nn.Module):
+    def __init__(self, in_features):
+        super(ResidualBlock, self).__init__()
+
+        self.block = nn.Sequential(
+            # nn.ReflectionPad2d(1),
+            nn.Conv2d(in_features, in_features, 3, stride=1, padding=1),
+            nn.InstanceNorm2d(in_features),
+            nn.ReLU(inplace=True),
+            # nn.ReflectionPad2d(1),
+            nn.Conv2d(in_features, in_features, 3, stride=1, padding=1),
+            nn.InstanceNorm2d(in_features),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return x + self.block(x)
 
 
+class GeneratorResNet(nn.Module):
+    def __init__(self, num_residual_blocks=8, in_features=256):
+        super(GeneratorResNet, self).__init__()
+
+        out_features = in_features
+
+        model = []
+
+        # Residual blocks
+        for _ in range(num_residual_blocks):
+            model += [ResidualBlock(out_features)]
+
+        # Upsampling
+        for _ in range(2):
+            out_features //= 2
+            model += [
+                nn.Upsample(scale_factor=2),
+                nn.Conv2d(in_features, out_features, 3, stride=1, padding=1),
+                nn.InstanceNorm2d(out_features),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(out_features, out_features, 3, stride=1, padding=1),
+                nn.InstanceNorm2d(out_features),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(out_features, out_features, 3, stride=1, padding=1),
+                nn.InstanceNorm2d(out_features),
+                nn.ReLU(inplace=True),
+            ]
+            in_features = out_features
+
+        # Output layer
+        # model += [nn.ReflectionPad2d(2), nn.Conv2d(out_features, 2, 7), nn.Softmax()]
+        model += [nn.Conv2d(out_features, 2, 7, stride=1, padding=3), nn.Sigmoid()]
+
+        self.model = nn.Sequential(*model)
+
+    def forward(self, feature_map):
+        x = self.model(feature_map)
+        return x
 
 
-def compute_IoU(mask, pred):
-    mask = mask!=0
-    pred = pred!=0
-    
-    m1 = np.logical_and(mask, pred)
-    m2 = np.logical_and(np.logical_not(mask), np.logical_not(pred))
-    m3 = np.logical_and(mask==0, pred==1)
-    m4 = np.logical_and(mask==1, pred==0)
-    m5 = np.logical_or(mask, pred)
-    
-    tp = np.count_nonzero(m1)
-    fp = np.count_nonzero(m3)
-    fn = np.count_nonzero(m4)
-    
-    IoU = tp/(tp+(fn+fp)) 
-    return IoU
+class Encoder(nn.Module):
+    def __init__(self, channels=3 + 2):
+        super(Encoder, self).__init__()
+
+        # Initial convolution block
+        out_features = 64
+        model = [
+            nn.Conv2d(channels, out_features, 7, stride=1, padding=3),
+            nn.InstanceNorm2d(out_features),
+            nn.ReLU(inplace=True),
+        ]
+        in_features = out_features
+
+        # Downsampling
+        for _ in range(2):
+            out_features *= 2
+            model += [
+                nn.Conv2d(in_features, out_features, 3, stride=1, padding=1),
+                nn.InstanceNorm2d(out_features),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(out_features, out_features, 3, stride=1, padding=1),
+                nn.InstanceNorm2d(out_features),
+                nn.ReLU(inplace=True),
+                nn.MaxPool2d(2, stride=2),
+            ]
+            in_features = out_features
+
+        self.model = nn.Sequential(*model)
+
+    def forward(self, arguments):
+        x = torch.cat(arguments, dim=1)
+        x = self.model(x)
+        return x
 
 
 def to_categorical(y, num_classes=None, dtype='float32'):
@@ -55,250 +132,217 @@ def to_categorical(y, num_classes=None, dtype='float32'):
 
 
 def predict_building(rgb, mask, model):
-	Tensor = torch.cuda.FloatTensor
+    Tensor = torch.cuda.FloatTensor
 
-	mask = to_categorical(mask, 2)
+    mask = to_categorical(mask, 2)
 
-	rgb = rgb[np.newaxis, :, :, :]
-	mask = mask[np.newaxis, :, :, :]
+    rgb = rgb[np.newaxis, :, :, :]
+    mask = mask[np.newaxis, :, :, :]
 
-	E, G = model
+    E, G = model
 
-	rgb = Tensor(rgb)
-	mask = Tensor(mask)
-	rgb = rgb.permute(0,3,1,2)
-	mask = mask.permute(0,3,1,2)
+    rgb = Tensor(rgb)
+    mask = Tensor(mask)
+    rgb = rgb.permute(0, 3, 1, 2)
+    mask = mask.permute(0, 3, 1, 2)
+    # print(rgb.shape)
+    # print(mask.shape)
 
-	rgb = rgb / 255.0
+    rgb = rgb / 255.0
 
-	# PREDICTION
-	pred = G(E([rgb, mask]))
-	pred = pred.permute(0,2,3,1)
+    # PREDICTION
+    pred = G(E([rgb, mask]))
+    pred = pred.permute(0, 2, 3, 1)
 
-	pred = pred.detach().cpu().numpy()
+    pred = pred.detach().cpu().numpy()
 
-	pred = np.argmax(pred[0,:,:,:], axis=-1)
-	return pred
-
+    pred = np.argmax(pred[0, :, :, :], axis=-1)
+    return pred
 
 
 def fix_limits(i_min, i_max, j_min, j_max, min_image_size=256):
+    def closest_divisible_size(size, factor=4):
+        while size % factor:
+            size += 1
+        return size
 
-	def closest_divisible_size(size, factor=4):
-		while size % factor:
-			size += 1
-		return size
+    height = i_max - i_min
+    width = j_max - j_min
 
-	height = i_max - i_min
-	width = j_max - j_min
+    # pad the rows
+    if height < min_image_size:
+        diff = min_image_size - height
+    else:
+        diff = closest_divisible_size(height) - height + 16
 
-	# pad the rows
-	if height < min_image_size:
-		diff = min_image_size - height
-	else:
-		diff = closest_divisible_size(height) - height + 16
+    i_min -= (diff // 2)
+    i_max += (diff // 2 + diff % 2)
 
-	i_min -= (diff // 2)
-	i_max += (diff // 2 + diff % 2)
+    # pad the columns
+    if width < min_image_size:
+        diff = min_image_size - width
+    else:
+        diff = closest_divisible_size(width) - width + 16
 
-	# pad the columns
-	if width < min_image_size:
-		diff = min_image_size - width
-	else:
-		diff = closest_divisible_size(width) - width + 16
+    j_min -= (diff // 2)
+    j_max += (diff // 2 + diff % 2)
 
-	j_min -= (diff // 2)
-	j_max += (diff // 2 + diff % 2)
-
-	return i_min, i_max, j_min, j_max
-
+    return i_min, i_max, j_min, j_max
 
 
-def regularization(rgb, ins_segmentation, model, in_mode="instance", out_mode="instance", min_size=10):
-    assert in_mode == "instance" or in_mode == "semantic"
+def regularization(rgb, ins_segmentation, model, in_mode="instance", out_mode="instance", min_size=10, build_val=255):
+    assert in_mode == "semantic"
     assert out_mode == "instance" or out_mode == "semantic"
 
-    if in_mode == "semantic":
-        ins_segmentation = np.uint16(measure.label(ins_segmentation, background=0))
-
-    max_instance = np.amax(ins_segmentation)
     border = 256
 
-    ins_segmentation = np.uint16(cv2.copyMakeBorder(ins_segmentation,border,border,border,border,cv2.BORDER_CONSTANT,value=0))
-    rgb = np.uint8(cv2.copyMakeBorder(rgb,border,border,border,border,cv2.BORDER_CONSTANT,value=(0,0,0)))
+    if rgb is None:
+        logging.debug(ins_segmentation.shape)
+        rgb = np.zeros((ins_segmentation.shape[0], ins_segmentation.shape[1], 3), dtype=np.uint8)
+
+    print('Padding...')
+    ins_segmentation = np.pad(array=ins_segmentation, pad_width=border, mode='constant', constant_values=0)
+    npad = ((border, border), (border, border), (0, 0))
+    rgb = np.pad(array=rgb, pad_width=npad, mode='constant', constant_values=0)
+    print('Done')
+
+    print('Counting buildings...')
+    contours_list = measure.find_contours(ins_segmentation)
+
+    max_instance = len(contours_list)
+    print(f'Found {max_instance} buildings!')
 
     regularization = np.zeros(ins_segmentation.shape, dtype=np.uint16)
 
-    for ins in tqdm(range(1, max_instance+1), desc="Regularization"):
-        indices = np.argwhere(ins_segmentation==ins)
+    for ins in tqdm(range(1, max_instance + 1), desc="Regularization"):
+        indices = contours_list[ins - 1]
         building_size = indices.shape[0]
         if building_size > min_size:
-            i_min = np.amin(indices[:,0])
-            i_max = np.amax(indices[:,0])
-            j_min = np.amin(indices[:,1])
-            j_max = np.amax(indices[:,1])
+            i_min = int(np.amin(indices[:, 0]))
+            i_max = int(np.amax(indices[:, 0]))
+            j_min = int(np.amin(indices[:, 1]))
+            j_max = int(np.amax(indices[:, 1]))
 
             i_min, i_max, j_min, j_max = fix_limits(i_min, i_max, j_min, j_max)
 
-            mask = np.copy(ins_segmentation[i_min:i_max, j_min:j_max] == ins)
+            if (i_max - i_min) > 10000 or (j_max - j_min) > 10000:
+                continue
+
+            mask = np.copy(ins_segmentation[i_min:i_max, j_min:j_max] == build_val)
+
             rgb_mask = np.copy(rgb[i_min:i_max, j_min:j_max, :])
 
-
-
-            max_building_size = 1024
+            max_building_size = 768
             rescaled = False
             if mask.shape[0] > max_building_size and mask.shape[0] >= mask.shape[1]:
                 f = max_building_size / mask.shape[0]
                 mask = rescale(mask, f, anti_aliasing=False, preserve_range=True)
-                rgb_mask = rescale(rgb_mask, f, anti_aliasing=False)
+                rgb_mask = rescale(rgb_mask, f, anti_aliasing=False, multichannel=True)
                 rescaled = True
             elif mask.shape[1] > max_building_size and mask.shape[1] >= mask.shape[0]:
                 f = max_building_size / mask.shape[1]
                 mask = rescale(mask, f, anti_aliasing=False)
-                rgb_mask = rescale(rgb_mask, f, anti_aliasing=False, preserve_range=True)
+                rgb_mask = rescale(rgb_mask, f, anti_aliasing=False, preserve_range=True, multichannel=True)
                 rescaled = True
 
             pred = predict_building(rgb_mask, mask, model)
 
             if rescaled:
-                pred = rescale(pred, 1/f, anti_aliasing=False, preserve_range=True)
-
-
+                pred = rescale(pred, 1 / f, anti_aliasing=False, preserve_range=True)
 
             pred_indices = np.argwhere(pred != 0)
 
             if pred_indices.shape[0] > 0:
-                pred_indices[:,0] = pred_indices[:,0] + i_min
-                pred_indices[:,1] = pred_indices[:,1] + j_min
+                pred_indices[:, 0] = pred_indices[:, 0] + i_min
+                pred_indices[:, 1] = pred_indices[:, 1] + j_min
                 x, y = zip(*pred_indices)
                 if out_mode == "semantic":
-                    regularization[x,y] = 1
+                    regularization[x, y] = 1
                 else:
-                    regularization[x,y] = ins
+                    regularization[x, y] = ins
 
     return regularization[border:-border, border:-border]
 
 
-
-def copyGeoreference(inp, output):
-    dataset = gdal.Open(inp)
-    if dataset is None:
-        print('Unable to open', inp, 'for reading')
-        sys.exit(1)
-
-    projection = dataset.GetProjection()
-    geotransform = dataset.GetGeoTransform()
-
-    if projection is None and geotransform is None:
-        print('No projection or geotransform found on file' + input)
-        sys.exit(1)
-
-    dataset2 = gdal.Open(output, gdal.GA_Update)
-
-    if dataset2 is None:
-        print('Unable to open', output, 'for writing')
-        sys.exit(1)
-
-    if geotransform is not None and geotransform != (0, 1, 0, 0, 0, 1):
-        dataset2.SetGeoTransform(geotransform)
-
-    if projection is not None and projection != '':
-        dataset2.SetProjection(projection)
-
-    gcp_count = dataset.GetGCPCount()
-    if gcp_count != 0:
-        dataset2.SetGCPs(dataset.GetGCPs(), dataset.GetGCPProjection())
-
-    dataset = None
-    dataset2 = None
+def arr_threshold(arr, value=127):
+    bool_M = (arr >= value)
+    arr[bool_M] = 255
+    arr[~bool_M] = 0
+    # print(np.unique(M))
+    return arr
 
 
+def regularize_buildings(pred_arr, sat_img_arr=None, apply_threshold=None, build_val=255):
+    if apply_threshold:
+        print('Applying threshold...')
+        pred_arr = arr_threshold(pred_arr, value=apply_threshold)
+    logging.debug(pred_arr.shape)
 
-def regularize_segmentations(img_folder, seg_folder, out_folder, in_mode="semantic", out_mode="instance", samples=None):
+    print('Done')
+    model_encoder = Path("saved_models_gan") / "E140000_e1"
+    model_generator = Path("saved_models_gan") / "E140000_net"
+    E1 = Encoder()
+    G = GeneratorResNet()
+    G.load_state_dict(torch.load(model_generator))
+    E1.load_state_dict(torch.load(model_encoder))
+    E1 = E1.cuda()
+    G = G.cuda()
+
+    model = [E1, G]
+    R = regularization(sat_img_arr, pred_arr, model, in_mode="semantic", out_mode="semantic", build_val=build_val)
+    return R
+
+
+def main(in_raster, out_raster, sat_img=None, build_val=255, apply_threshold=False):
     """
-    BUILDING REGULARIZATION
-    Inputs:
-     - satellite image (3 channels)
-     - building segmentation (1 channel)
-    Output:
-     - regularized mask
+    -------
+    :param params: (dict) Parameters found in the yaml config file.
     """
+    start_time = time.time()
+    in_raster = Path(in_raster)
+    if not in_raster.is_file():
+        raise FileNotFoundError(f"Input inference raster not a file: {in_raster}")
+    out_raster = Path(out_raster)
 
-    img_files = glob.glob(img_folder)
-    seg_files = glob.glob(seg_folder)
+    try:
+        with rasterio.open(in_raster, 'r') as raw_pred:
+            outname_reg = Path(out_raster)
+            logging.debug(f'Regularizing buildings in {in_raster}...')
+            meta = raw_pred.meta
+            raw_pred_arr = raw_pred.read()[0, ...]
+            raw_pred_arr_buildings = np.zeros(shape=raw_pred_arr.shape, dtype=np.uint8)
+            raw_pred_arr_buildings[raw_pred_arr == build_val] = build_val
+            raw_pred_arr[raw_pred_arr == build_val] = 0
+            reg_arr = regularize_buildings(raw_pred_arr_buildings, sat_img_arr=sat_img, apply_threshold=apply_threshold,
+                                           build_val=build_val)
+            reg_arr[reg_arr == 1] = build_val
+            raw_pred_arr[reg_arr == build_val] = build_val
+            out_arr = raw_pred_arr[np.newaxis, :, :]
 
-    img_files.sort()
-    seg_files.sort()
+            meta.update({"dtype": 'uint8', "compress": 'lzw'})
+            with rasterio.open(outname_reg, 'w+', **meta) as out:
+                logging.info(f'Successfully regularized on {in_raster}\nWriting to file: {outname_reg}')
+                out.write(out_arr.astype(np.uint8))
+    except IOError as e:
+        logging.error(f"Failed to regularize {in_raster}\n{e}")
 
-    for num, (satellite_image_file, building_segmentation_file) in enumerate(zip(img_files, seg_files)):
-        print(satellite_image_file, building_segmentation_file)
-        _, rgb_name = os.path.split(satellite_image_file)
-        _, seg_name = os.path.split(building_segmentation_file)
-        assert rgb_name == seg_name
+    logging.info(f"End of process. Elapsed time: {int(time.time() - start_time)} seconds")
 
-        output_file = out_folder + seg_name
-
-        E1 = Encoder()
-        G = GeneratorResNet()
-        G.load_state_dict(torch.load(var.MODEL_GENERATOR))
-        E1.load_state_dict(torch.load(var.MODEL_ENCODER))
-        E1 = E1.cuda()
-        G = G.cuda()
-
-        model = [E1,G]
-
-        M = io.imread(building_segmentation_file)
-        M = np.uint16(M)
-        P = io.imread(satellite_image_file)
-        P = np.uint8(P)
-
-        R = regularization(P, M, model, in_mode=in_mode, out_mode=out_mode)
-
-        if out_mode == "instance":
-            io.imsave(output_file, np.uint16(R))
-        else:
-            io.imsave(output_file, np.uint8(R*255))
-
-        if samples is not None:
-            i = 1000
-            j = 1000
-            h, w = 1080, 1920
-            P = P[i:i+h, j:j+w]
-            R = R[i:i+h, j:j+w]
-            M = M[i:i+h, j:j+w]
-
-            R = mark_boundaries(P, R, mode="thick")
-            M = mark_boundaries(P, M, mode="thick")
-
-            R = np.uint8(R*255)
-            M = np.uint8(M*255)
-
-            font                   = cv2.FONT_HERSHEY_SIMPLEX
-            bottomLeftCornerOfText = (20,1060)
-            fontScale              = 1
-            fontColor              = (255,255,0)
-            lineType               = 2
-
-            cv2.putText(R, "INRIA dataset, " + rgb_name + ", regularization", 
-                bottomLeftCornerOfText, 
-                font, 
-                fontScale,
-                fontColor,
-                lineType)
-
-            cv2.putText(M, "INRIA dataset, " + rgb_name + ", segmentation", 
-                bottomLeftCornerOfText, 
-                font, 
-                fontScale,
-                fontColor,
-                lineType)
-
-            io.imsave(samples + "./%d_2reg.png" % num, np.uint8(R))
-            io.imsave(samples + "./%d_1seg.png" % num, np.uint8(M))
-
-        copyGeoreference(satellite_image_file, output_file)
-        copyGeoreference(satellite_image_file, building_segmentation_file)
-
-
-
-regularize_segmentations(img_folder=var.INF_RGB, seg_folder=var.INF_SEG, out_folder=var.INF_OUT, in_mode="semantic", out_mode="instance", samples=None)
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Buildings inference regularization')
+    parser.add_argument('--input-inf', help='Input inference as raster containing building predictions ')
+    parser.add_argument('--input-rgb', default=None, help='Input RGB raster used to produce the inference')
+    parser.add_argument('--output', help='Output inference as raster containing regularized building predictions ')
+    input_type = parser.add_mutually_exclusive_group()
+    input_type.add_argument('--build-val', default=255,
+                        help='Pixel value corresponding to building prediction in input raster')
+    input_type.add_argument('--threshold-val', default=None,
+                            help='If input raster contains a heatmap, a threshold will be applied at this value. Above'
+                                 'this value, all pixels will be considered as buildings and below, background.')
+    args = parser.parse_args()
+    print(f'\n\nStarting building regularization with {args.input_inf}\n\n')
+    main(in_raster=args.input_inf,
+         out_raster=args.output,
+         sat_img=args.input_rgb,
+         build_val=args.build_val,
+         apply_threshold=int(args.threshold_val))
