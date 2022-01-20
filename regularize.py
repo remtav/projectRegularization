@@ -190,29 +190,30 @@ def fix_limits(i_min, i_max, j_min, j_max, min_image_size=256):
     return i_min, i_max, j_min, j_max
 
 
-def regularization(rgb, ins_segmentation, model, in_mode="instance", out_mode="instance", min_size=10, build_val=255):
+def regularization(rgb, ins_segmentation, model, in_mode="instance", out_mode="instance", min_size=10):
     assert in_mode == "semantic"
     assert out_mode == "instance" or out_mode == "semantic"
 
     border = 256
 
-    if rgb is None:
-        logging.debug(ins_segmentation.shape)
-        rgb = np.zeros((ins_segmentation.shape[0], ins_segmentation.shape[1], 3), dtype=np.uint8)
 
-    print('Padding...')
-    ins_segmentation = np.pad(array=ins_segmentation, pad_width=border, mode='constant', constant_values=0)
-    npad = ((border, border), (border, border), (0, 0))
-    rgb = np.pad(array=rgb, pad_width=npad, mode='constant', constant_values=0)
+
+    #print('Padding...', end="")
+    ins_segmentation_padded = np.pad(array=ins_segmentation, pad_width=border, mode='constant', constant_values=0)
+    del ins_segmentation
+    print('Counting buildings...', end="")
+    contours_list = measure.find_contours(ins_segmentation_padded)
     print('Done')
-
-    print('Counting buildings...')
-    contours_list = measure.find_contours(ins_segmentation)
-
     max_instance = len(contours_list)
     print(f'Found {max_instance} buildings!')
 
-    regularization = np.zeros(ins_segmentation.shape, dtype=np.uint16)
+    if rgb is None:
+        logging.debug(ins_segmentation_padded.shape)
+        rgb = np.zeros((ins_segmentation_padded.shape[0], ins_segmentation_padded.shape[1], 3), dtype=np.bool)
+    npad = ((border, border), (border, border), (0, 0))
+    rgb = np.pad(array=rgb, pad_width=npad, mode='constant', constant_values=0)
+
+    regularization = np.zeros(ins_segmentation_padded.shape, dtype=np.uint16)
 
     for ins in tqdm(range(1, max_instance + 1), desc="Regularization"):
         indices = contours_list[ins - 1]
@@ -228,7 +229,7 @@ def regularization(rgb, ins_segmentation, model, in_mode="instance", out_mode="i
             if (i_max - i_min) > 10000 or (j_max - j_min) > 10000:
                 continue
 
-            mask = np.copy(ins_segmentation[i_min:i_max, j_min:j_max] == build_val)
+            mask = np.copy(ins_segmentation_padded[i_min:i_max, j_min:j_max] == 1)
 
             rgb_mask = np.copy(rgb[i_min:i_max, j_min:j_max, :])
 
@@ -268,17 +269,10 @@ def arr_threshold(arr, value=127):
     bool_M = (arr >= value)
     arr[bool_M] = 255
     arr[~bool_M] = 0
-    # print(np.unique(M))
     return arr
 
 
-def regularize_buildings(pred_arr, sat_img_arr=None, apply_threshold=None, build_val=255):
-    if apply_threshold:
-        print('Applying threshold...')
-        pred_arr = arr_threshold(pred_arr, value=apply_threshold)
-    logging.debug(pred_arr.shape)
-
-    print('Done')
+def regularize_buildings(pred_arr, sat_img_arr=None):
     model_encoder = Path("saved_models_gan") / "E140000_e1"
     model_generator = Path("saved_models_gan") / "E140000_net"
     E1 = Encoder()
@@ -289,7 +283,7 @@ def regularize_buildings(pred_arr, sat_img_arr=None, apply_threshold=None, build
     G = G.cuda()
 
     model = [E1, G]
-    R = regularization(sat_img_arr, pred_arr, model, in_mode="semantic", out_mode="semantic", build_val=build_val)
+    R = regularization(sat_img_arr, pred_arr, model, in_mode="semantic", out_mode="semantic")
     return R
 
 
@@ -306,16 +300,26 @@ def main(in_raster, out_raster, sat_img=None, build_val=255, apply_threshold=Fal
 
     try:
         with rasterio.open(in_raster, 'r') as raw_pred:
-            outname_reg = Path(out_raster)
             logging.debug(f'Regularizing buildings in {in_raster}...')
+            raw_pred_arr = raw_pred.read()[0, ...]
+
+            if apply_threshold:
+                print('Applying threshold...', end="")
+                raw_pred_arr = arr_threshold(raw_pred_arr, value=apply_threshold)
+            logging.debug(raw_pred_arr.shape)
+            print('Done')
+
+            raw_pred_arr_buildings = np.zeros(shape=raw_pred_arr.shape, dtype=np.bool)
+            raw_pred_arr_buildings[raw_pred_arr == build_val] = 1  # Draw buildings on empty array
+            del raw_pred_arr
+            reg_arr = regularize_buildings(raw_pred_arr_buildings, sat_img_arr=sat_img)
+
+        with rasterio.open(in_raster, 'r') as raw_pred:
+            outname_reg = Path(out_raster)
             meta = raw_pred.meta
             raw_pred_arr = raw_pred.read()[0, ...]
-            raw_pred_arr_buildings = np.zeros(shape=raw_pred_arr.shape, dtype=np.uint8)
-            raw_pred_arr_buildings[raw_pred_arr == build_val] = build_val
-            raw_pred_arr[raw_pred_arr == build_val] = 0
-            reg_arr = regularize_buildings(raw_pred_arr_buildings, sat_img_arr=sat_img, apply_threshold=apply_threshold,
-                                           build_val=build_val)
-            reg_arr[reg_arr == 1] = build_val
+            reg_arr[reg_arr == 1] = build_val  # Set building value to outputted regularized building
+            raw_pred_arr[raw_pred_arr == build_val] = 0  # Erase building on input inference
             raw_pred_arr[reg_arr == build_val] = build_val
             out_arr = raw_pred_arr[np.newaxis, :, :]
 
@@ -323,6 +327,7 @@ def main(in_raster, out_raster, sat_img=None, build_val=255, apply_threshold=Fal
             with rasterio.open(outname_reg, 'w+', **meta) as out:
                 logging.info(f'Successfully regularized on {in_raster}\nWriting to file: {outname_reg}')
                 out.write(out_arr.astype(np.uint8))
+
     except IOError as e:
         logging.error(f"Failed to regularize {in_raster}\n{e}")
 
@@ -334,9 +339,9 @@ if __name__ == '__main__':
     parser.add_argument('--input-rgb', default=None, help='Input RGB raster used to produce the inference')
     parser.add_argument('--output', help='Output inference as raster containing regularized building predictions ')
     input_type = parser.add_mutually_exclusive_group()
-    input_type.add_argument('--build-val', default=255,
+    input_type.add_argument('--build-val', default=255, type=int,
                         help='Pixel value corresponding to building prediction in input raster')
-    input_type.add_argument('--threshold-val', default=None,
+    input_type.add_argument('--threshold-val', default=None, type=int,
                             help='If input raster contains a heatmap, a threshold will be applied at this value. Above'
                                  'this value, all pixels will be considered as buildings and below, background.')
     args = parser.parse_args()
@@ -345,4 +350,5 @@ if __name__ == '__main__':
          out_raster=args.output,
          sat_img=args.input_rgb,
          build_val=args.build_val,
-         apply_threshold=int(args.threshold_val))
+         apply_threshold=args.threshold_val)
+
