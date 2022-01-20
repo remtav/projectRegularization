@@ -1,5 +1,7 @@
 import gc
 
+from rasterio.plot import reshape_as_image
+
 from logger import set_logging
 
 print('Importing packages and modules...')
@@ -297,10 +299,10 @@ def main(in_raster, out_raster, sat_img=None, build_val=255, apply_threshold=Fal
     :param params: (dict) Parameters found in the yaml config file.
     """
     start_time = time.time()
-
     in_raster = Path(in_raster)
     if not in_raster.is_file():
         raise FileNotFoundError(f"Input inference raster not a file: {in_raster}")
+    logging.debug(f'Regularizing buildings in {in_raster}...')
     out_raster = Path(out_raster)
 
     console_level_logging = 'INFO' if not debug else 'DEBUG'
@@ -308,8 +310,14 @@ def main(in_raster, out_raster, sat_img=None, build_val=255, apply_threshold=Fal
 
     try:
         with rasterio.open(in_raster, 'r') as raw_pred:
-            logging.debug(f'Regularizing buildings in {in_raster}...')
             raw_pred_arr = raw_pred.read()[0, ...]
+
+        if sat_img:
+            with rasterio.open(sat_img, 'r') as raw_rgb:
+                raw_rgb_arr = raw_rgb.read()
+                raw_rgb_arr = reshape_as_image(raw_rgb_arr)
+        else:
+            raw_rgb_arr = None
 
         if apply_threshold:
             logging.info('Applying threshold...')
@@ -321,7 +329,7 @@ def main(in_raster, out_raster, sat_img=None, build_val=255, apply_threshold=Fal
         raw_pred_arr_buildings[raw_pred_arr == build_val] = 1  # Draw buildings on empty array
         del raw_pred_arr
         gc.collect()
-        reg_arr = regularize_buildings(raw_pred_arr_buildings, sat_img_arr=sat_img)
+        reg_arr = regularize_buildings(raw_pred_arr_buildings, sat_img_arr=raw_rgb_arr)
 
         with rasterio.open(in_raster, 'r') as raw_pred:
             outname_reg = Path(out_raster)
