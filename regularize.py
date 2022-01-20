@@ -1,3 +1,7 @@
+import gc
+
+from logger import set_logging
+
 print('Importing packages and modules...')
 import argparse
 import multiprocessing
@@ -19,7 +23,7 @@ from tqdm import tqdm
 
 logging.getLogger(__name__)
 
-print('Done')
+logging.info('Done')
 
 class ResidualBlock(nn.Module):
     def __init__(self, in_features):
@@ -145,8 +149,8 @@ def predict_building(rgb, mask, model):
     mask = Tensor(mask)
     rgb = rgb.permute(0, 3, 1, 2)
     mask = mask.permute(0, 3, 1, 2)
-    # print(rgb.shape)
-    # print(mask.shape)
+    # logging.info(rgb.shape)
+    # logging.info(mask.shape)
 
     rgb = rgb / 255.0
 
@@ -196,22 +200,22 @@ def regularization(rgb, ins_segmentation, model, in_mode="instance", out_mode="i
 
     border = 256
 
-
-
-    #print('Padding...', end="")
     ins_segmentation_padded = np.pad(array=ins_segmentation, pad_width=border, mode='constant', constant_values=0)
     del ins_segmentation
-    print('Counting buildings...', end="")
+    gc.collect()
+    logging.info('Counting buildings...')
     contours_list = measure.find_contours(ins_segmentation_padded)
-    print('Done')
+    logging.info('Done')
     max_instance = len(contours_list)
-    print(f'Found {max_instance} buildings!')
+    logging.info(f'Found {max_instance} buildings!')
 
+    # Not providing RGB as input seems to have very little impact
     if rgb is None:
         logging.debug(ins_segmentation_padded.shape)
         rgb = np.zeros((ins_segmentation_padded.shape[0], ins_segmentation_padded.shape[1], 3), dtype=np.bool)
     npad = ((border, border), (border, border), (0, 0))
-    rgb = np.pad(array=rgb, pad_width=npad, mode='constant', constant_values=0)
+    # Pad RGB after counting building for memory optimization
+    rgb_padded = np.pad(array=rgb, pad_width=npad, mode='constant', constant_values=0)
 
     regularization = np.zeros(ins_segmentation_padded.shape, dtype=np.uint16)
 
@@ -231,7 +235,7 @@ def regularization(rgb, ins_segmentation, model, in_mode="instance", out_mode="i
 
             mask = np.copy(ins_segmentation_padded[i_min:i_max, j_min:j_max] == 1)
 
-            rgb_mask = np.copy(rgb[i_min:i_max, j_min:j_max, :])
+            rgb_mask = np.copy(rgb_padded[i_min:i_max, j_min:j_max, :])
 
             max_building_size = 768
             rescaled = False
@@ -287,37 +291,49 @@ def regularize_buildings(pred_arr, sat_img_arr=None):
     return R
 
 
-def main(in_raster, out_raster, sat_img=None, build_val=255, apply_threshold=False):
+def main(in_raster, out_raster, sat_img=None, build_val=255, apply_threshold=False, debug=False):
     """
     -------
     :param params: (dict) Parameters found in the yaml config file.
     """
     start_time = time.time()
+
     in_raster = Path(in_raster)
     if not in_raster.is_file():
         raise FileNotFoundError(f"Input inference raster not a file: {in_raster}")
     out_raster = Path(out_raster)
+
+    console_level_logging = 'INFO' if not debug else 'DEBUG'
+    set_logging(console_level=console_level_logging, logfiles_dir=out_raster.parent)
 
     try:
         with rasterio.open(in_raster, 'r') as raw_pred:
             logging.debug(f'Regularizing buildings in {in_raster}...')
             raw_pred_arr = raw_pred.read()[0, ...]
 
-            if apply_threshold:
-                print('Applying threshold...', end="")
-                raw_pred_arr = arr_threshold(raw_pred_arr, value=apply_threshold)
-            logging.debug(raw_pred_arr.shape)
-            print('Done')
+        if apply_threshold:
+            logging.info('Applying threshold...')
+            raw_pred_arr = arr_threshold(raw_pred_arr, value=apply_threshold)
+        logging.debug(raw_pred_arr.shape)
+        logging.info('Done')
 
-            raw_pred_arr_buildings = np.zeros(shape=raw_pred_arr.shape, dtype=np.bool)
-            raw_pred_arr_buildings[raw_pred_arr == build_val] = 1  # Draw buildings on empty array
-            del raw_pred_arr
-            reg_arr = regularize_buildings(raw_pred_arr_buildings, sat_img_arr=sat_img)
+        raw_pred_arr_buildings = np.zeros(shape=raw_pred_arr.shape, dtype=np.bool)
+        raw_pred_arr_buildings[raw_pred_arr == build_val] = 1  # Draw buildings on empty array
+        del raw_pred_arr
+        gc.collect()
+        reg_arr = regularize_buildings(raw_pred_arr_buildings, sat_img_arr=sat_img)
 
         with rasterio.open(in_raster, 'r') as raw_pred:
             outname_reg = Path(out_raster)
             meta = raw_pred.meta
             raw_pred_arr = raw_pred.read()[0, ...]
+
+            if apply_threshold:
+                logging.info('Applying threshold...')
+                raw_pred_arr = arr_threshold(raw_pred_arr, value=apply_threshold)
+            logging.debug(raw_pred_arr.shape)
+            logging.info('Done')
+
             reg_arr[reg_arr == 1] = build_val  # Set building value to outputted regularized building
             raw_pred_arr[raw_pred_arr == build_val] = 0  # Erase building on input inference
             raw_pred_arr[reg_arr == build_val] = build_val
@@ -345,7 +361,7 @@ if __name__ == '__main__':
                             help='If input raster contains a heatmap, a threshold will be applied at this value. Above'
                                  'this value, all pixels will be considered as buildings and below, background.')
     args = parser.parse_args()
-    print(f'\n\nStarting building regularization with {args.input_inf}\n\n')
+    logging.info(f'\n\nStarting building regularization with {args.input_inf}\n\n')
     main(in_raster=args.input_inf,
          out_raster=args.output,
          sat_img=args.input_rgb,
