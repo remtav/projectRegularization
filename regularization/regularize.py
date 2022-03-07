@@ -3,7 +3,7 @@ import sys
 
 from rasterio.plot import reshape_as_image
 
-from logger import set_logging
+# from logger import set_logging
 
 import argparse
 import logging
@@ -304,8 +304,8 @@ def main(in_raster, out_raster, models_dir: str, sat_img=None, build_val=255, ap
     logging.debug(f'Regularizing buildings in {in_raster}...')
     out_raster = Path(out_raster)
 
-    console_level_logging = 'INFO' if not debug else 'DEBUG'
-    set_logging(console_level=console_level_logging, logfiles_dir=out_raster.parent)
+    # console_level_logging = 'INFO' if not debug else 'DEBUG'
+    # set_logging(console_level=console_level_logging, logfiles_dir=out_raster.parent)
 
     try:
         with rasterio.open(in_raster, 'r') as raw_pred:
