@@ -1,12 +1,11 @@
 import gc
+import sys
 
 from rasterio.plot import reshape_as_image
 
 from logger import set_logging
 
-print('Importing packages and modules...')
 import argparse
-import multiprocessing
 import logging
 import logging.config
 
@@ -278,9 +277,9 @@ def arr_threshold(arr, value=127):
     return arr
 
 
-def regularize_buildings(pred_arr, sat_img_arr=None):
-    model_encoder = Path("saved_models_gan") / "E140000_e1"
-    model_generator = Path("saved_models_gan") / "E140000_net"
+def regularize_buildings(pred_arr, models_dir: str, sat_img_arr=None):
+    model_encoder = Path(models_dir) / "E140000_e1"
+    model_generator = Path(models_dir) / "E140000_net"
     E1 = Encoder()
     G = GeneratorResNet()
     G.load_state_dict(torch.load(model_generator))
@@ -293,7 +292,7 @@ def regularize_buildings(pred_arr, sat_img_arr=None):
     return R
 
 
-def main(in_raster, out_raster, sat_img=None, build_val=255, apply_threshold=False, debug=False):
+def main(in_raster, out_raster, models_dir: str, sat_img=None, build_val=255, apply_threshold=False, debug=False):
     """
     -------
     :param params: (dict) Parameters found in the yaml config file.
@@ -329,7 +328,7 @@ def main(in_raster, out_raster, sat_img=None, build_val=255, apply_threshold=Fal
         raw_pred_arr_buildings[raw_pred_arr == build_val] = 1  # Draw buildings on empty array
         del raw_pred_arr
         gc.collect()
-        reg_arr = regularize_buildings(raw_pred_arr_buildings, sat_img_arr=raw_rgb_arr)
+        reg_arr = regularize_buildings(raw_pred_arr_buildings, models_dir=models_dir, sat_img_arr=raw_rgb_arr)
 
         with rasterio.open(in_raster, 'r') as raw_pred:
             outname_reg = Path(out_raster)

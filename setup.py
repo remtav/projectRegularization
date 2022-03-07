@@ -12,7 +12,7 @@ from shutil import rmtree
 from setuptools import find_packages, setup, Command
 
 # Package meta-data.
-NAME = 'Regularization'
+NAME = 'regularization'
 DESCRIPTION = 'Regularization of Building Boundaries in Satellite and Aerial Images with Pytorch'
 URL = 'https://github.com/remtav/projectRegularization'
 EMAIL = 'remitavon@gmail.com'
