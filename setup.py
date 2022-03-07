@@ -18,7 +18,7 @@ URL = 'https://github.com/remtav/projectRegularization'
 EMAIL = 'remitavon@gmail.com'
 AUTHOR = 'Stefano Zorzi'
 REQUIRES_PYTHON = '>=3.9.0'
-VERSION = None
+VERSION = '0.0.0'
 
 # The rest you shouldn't have to touch too much :)
 # ------------------------------------------------
