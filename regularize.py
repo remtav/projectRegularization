@@ -214,7 +214,7 @@ def regularization(rgb, ins_segmentation, model, in_mode="instance", out_mode="i
     # Not providing RGB as input seems to have very little impact
     if rgb is None:
         logging.debug(ins_segmentation_padded.shape)
-        rgb = np.zeros((ins_segmentation_padded.shape[0], ins_segmentation_padded.shape[1], 3), dtype=np.bool)
+        rgb = np.zeros((ins_segmentation_padded.shape[0], ins_segmentation_padded.shape[1], 3), dtype=bool)
     npad = ((border, border), (border, border), (0, 0))
     # Pad RGB after counting building for memory optimization
     rgb_padded = np.pad(array=rgb, pad_width=npad, mode='constant', constant_values=0)
@@ -325,7 +325,7 @@ def main(in_raster, out_raster, sat_img=None, build_val=255, apply_threshold=Fal
         logging.debug(raw_pred_arr.shape)
         logging.info('Done')
 
-        raw_pred_arr_buildings = np.zeros(shape=raw_pred_arr.shape, dtype=np.bool)
+        raw_pred_arr_buildings = np.zeros(shape=raw_pred_arr.shape, dtype=bool)
         raw_pred_arr_buildings[raw_pred_arr == build_val] = 1  # Draw buildings on empty array
         del raw_pred_arr
         gc.collect()
