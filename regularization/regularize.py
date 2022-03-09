@@ -1,9 +1,10 @@
 import gc
-import sys
 
+import geopandas
+from rasterio import features
 from rasterio.plot import reshape_as_image
 
-# from logger import set_logging
+from logger import set_logging
 
 import argparse
 import logging
@@ -284,7 +285,7 @@ def regularize_buildings(pred_arr, models_dir: str, sat_img_arr=None):
     G = GeneratorResNet()
     G.load_state_dict(torch.load(model_generator))
     E1.load_state_dict(torch.load(model_encoder))
-    E1 = E1.cuda()
+    E1 = E1.cuda()  # TODO: implement on cpu
     G = G.cuda()
 
     model = [E1, G]
@@ -292,27 +293,51 @@ def regularize_buildings(pred_arr, models_dir: str, sat_img_arr=None):
     return R
 
 
-def main(in_raster, out_raster, models_dir: str, sat_img=None, build_val=255, apply_threshold=False, debug=False):
+def main(in_pred_raster,
+         out_raster,
+         models_dir: str,
+         in_pred_vector = None,
+         in_sat_img=None,
+         build_val=255,
+         apply_threshold=False,
+         log_conf_path: str = 'logging.conf',
+         debug=False):
     """
     -------
     :param params: (dict) Parameters found in the yaml config file.
     """
     start_time = time.time()
-    in_raster = Path(in_raster)
-    if not in_raster.is_file():
-        raise FileNotFoundError(f"Input inference raster not a file: {in_raster}")
-    logging.debug(f'Regularizing buildings in {in_raster}...')
+    in_pred_raster = Path(in_pred_raster)
+    if not in_pred_raster.is_file():
+        raise FileNotFoundError(f"Input inference raster not a file: {in_pred_raster}")
+    logging.debug(f'Regularizing buildings in {in_pred_raster}...')
     out_raster = Path(out_raster)
 
-    # console_level_logging = 'INFO' if not debug else 'DEBUG'
-    # set_logging(console_level=console_level_logging, logfiles_dir=out_raster.parent)
+    console_level_logging = 'INFO' if not debug else 'DEBUG'
+    set_logging(console_level=console_level_logging, logfiles_dir=out_raster.parent, conf_path=log_conf_path)
 
     try:
-        with rasterio.open(in_raster, 'r') as raw_pred:
-            raw_pred_arr = raw_pred.read()[0, ...]
+        if in_pred_vector:  # With vector input, around 5% of pixels may bear different values compared to raster pred
+            gdf = geopandas.read_file(in_pred_vector)
+            # Get list of geometries for all features in vector file
+            geom = [shapes for shapes in gdf.geometry]
+            raster = rasterio.open(in_pred_raster)
+            # Rasterize vector using the shape and coordinate system of the raster
+            raw_pred_arr = features.rasterize(geom,
+                                            out_shape=raster.shape,
+                                            fill=0,
+                                            out=None,
+                                            transform=raster.transform,
+                                            all_touched=False,
+                                            default_value=1,
+                                            dtype=None)
+        else:
+            with rasterio.open(in_pred_raster, 'r') as raw_pred:
+                raw_pred_arr = raw_pred.read()[0, ...]
 
-        if sat_img:
-            with rasterio.open(sat_img, 'r') as raw_rgb:
+
+        if in_sat_img:
+            with rasterio.open(in_sat_img, 'r') as raw_rgb:
                 raw_rgb_arr = raw_rgb.read()
                 raw_rgb_arr = reshape_as_image(raw_rgb_arr)
         else:
@@ -330,7 +355,7 @@ def main(in_raster, out_raster, models_dir: str, sat_img=None, build_val=255, ap
         gc.collect()
         reg_arr = regularize_buildings(raw_pred_arr_buildings, models_dir=models_dir, sat_img_arr=raw_rgb_arr)
 
-        with rasterio.open(in_raster, 'r') as raw_pred:
+        with rasterio.open(in_pred_raster, 'r') as raw_pred:
             outname_reg = Path(out_raster)
             meta = raw_pred.meta
             raw_pred_arr = raw_pred.read()[0, ...]
@@ -348,19 +373,22 @@ def main(in_raster, out_raster, models_dir: str, sat_img=None, build_val=255, ap
 
             meta.update({"dtype": 'uint8', "compress": 'lzw'})
             with rasterio.open(outname_reg, 'w+', **meta) as out:
-                logging.info(f'Successfully regularized on {in_raster}\nWriting to file: {outname_reg}')
+                logging.info(f'Successfully regularized on {in_pred_raster}\nWriting to file: {outname_reg}')
                 out.write(out_arr.astype(np.uint8))
 
     except IOError as e:
-        logging.error(f"Failed to regularize {in_raster}\n{e}")
+        logging.error(f"Failed to regularize {in_pred_raster}\n{e}")
 
     logging.info(f"End of process. Elapsed time: {int(time.time() - start_time)} seconds")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Buildings inference regularization')
     parser.add_argument('--input-inf', help='Input inference as raster containing building predictions ')
+    parser.add_argument('--input-inf-vector', help='Input inference as polygons containing building predictions ')
     parser.add_argument('--input-rgb', default=None, help='Input RGB raster used to produce the inference')
     parser.add_argument('--output', help='Output inference as raster containing regularized building predictions ')
+    parser.add_argument('--models-dir', help='Directory where pretrained weights can be found ')
+    parser.add_argument('--log-conf-path', help='Path to python logging configuration file')
     input_type = parser.add_mutually_exclusive_group()
     input_type.add_argument('--build-val', default=255, type=int,
                         help='Pixel value corresponding to building prediction in input raster')
@@ -369,9 +397,12 @@ if __name__ == '__main__':
                                  'this value, all pixels will be considered as buildings and below, background.')
     args = parser.parse_args()
     logging.info(f'\n\nStarting building regularization with {args.input_inf}\n\n')
-    main(in_raster=args.input_inf,
+    main(in_pred_raster=args.input_inf,
+         in_pred_vector=args.input_inf_vector,
          out_raster=args.output,
-         sat_img=args.input_rgb,
+         in_sat_img=args.input_rgb,
          build_val=args.build_val,
-         apply_threshold=args.threshold_val)
+         apply_threshold=args.threshold_val,
+         models_dir=args.models_dir,
+         log_conf_path=args.log_conf_path)
 
