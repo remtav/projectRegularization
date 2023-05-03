@@ -4,7 +4,7 @@ channels:
   - conda-forge
 dependencies:
   - numpy>=1.22.2
-  - opencv-python>=4.5.5.62
+  - opencv>=4.5.5
   - rasterio>=1.2.10
   - scikit-image>=0.19.1
   - pytorch>=1.10.0
